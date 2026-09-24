@@ -99,6 +99,85 @@ defmodule Supavisor.Integration.SecretCheckerTest do
     assert %{user: _} = secrets.sasl_secrets
   end
 
+  test "rotating a SCRAM password invalidates cached upstream secrets", %{
+    db_conf: db_conf,
+    tenant_id: tenant_id
+  } do
+    role = "secret_checker_user_#{System.unique_integer([:positive])}"
+    password = "rotated_password"
+
+    origin =
+      start_supervised!(
+        {Postgrex,
+         hostname: db_conf[:hostname],
+         port: db_conf[:port],
+         database: db_conf[:database],
+         password: db_conf[:password],
+         username: db_conf[:username]},
+        id: :origin_conn
+      )
+
+    P.query!(origin, "SET password_encryption = 'scram-sha-256'", [])
+    P.query!(origin, "CREATE ROLE #{role} LOGIN PASSWORD '#{password}'", [])
+
+    on_exit(fn ->
+      {:ok, cleanup} =
+        Postgrex.start_link(
+          hostname: db_conf[:hostname],
+          port: db_conf[:port],
+          database: db_conf[:database],
+          password: db_conf[:password],
+          username: db_conf[:username]
+        )
+
+      P.query!(cleanup, "DROP ROLE #{role}", [])
+      GenServer.stop(cleanup)
+    end)
+
+    proxy =
+      start_supervised!(
+        {Postgrex,
+         hostname: db_conf[:hostname],
+         port: Application.get_env(:supavisor, :proxy_port_transaction),
+         database: db_conf[:database],
+         password: password,
+         username: "#{role}.#{tenant_id}"},
+        id: :proxy_conn
+      )
+
+    assert %P.Result{rows: [[1]]} = P.query!(proxy, "SELECT 1", [])
+
+    pool_id =
+      Supavisor.id(
+        type: :single,
+        tenant: tenant_id,
+        user: role,
+        mode: :transaction,
+        db: db_conf[:database]
+      )
+
+    assert {:ok, original} = Supavisor.SecretChecker.get_secrets(pool_id)
+    assert {:ok, _} = Supavisor.ClientAuthentication.get_validation_secrets(tenant_id, role)
+
+    # A fresh upstream connection would still use the previous salt-bound key.
+    true = Supavisor.TenantCache.put_upstream_auth_secrets(pool_id, original.sasl_secrets)
+    assert {:ok, _} = Supavisor.SecretChecker.get_secrets(pool_id)
+
+    assert {:ok, _} = Supavisor.UpstreamAuthentication.get_upstream_auth_secrets(pool_id)
+
+    P.query!(origin, "ALTER ROLE #{role} PASSWORD '#{password}'", [])
+
+    assert {:ok, rotated} = Supavisor.SecretChecker.get_secrets(pool_id)
+    refute rotated.sasl_secrets.salt == original.sasl_secrets.salt
+
+    assert {:ok, cached} =
+             Supavisor.ClientAuthentication.get_validation_secrets(tenant_id, role)
+
+    assert cached.sasl_secrets.salt == rotated.sasl_secrets.salt
+    assert {:error, :not_found} =
+             Supavisor.UpstreamAuthentication.get_upstream_auth_secrets(pool_id)
+  end
+
   test "fetch_validation_secrets does not hang when SecretChecker exits", %{
     db_conf: db_conf,
     tenant_id: tenant_id

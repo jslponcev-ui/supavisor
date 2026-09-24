@@ -9,6 +9,7 @@ defmodule Supavisor.SecretChecker do
   alias Supavisor.ClientAuthentication
   alias Supavisor.ClientAuthentication.ValidationSecrets
   alias Supavisor.Errors.AuthQueryError
+  alias Supavisor.UpstreamAuthentication
 
   @interval :timer.seconds(15)
 
@@ -71,6 +72,7 @@ defmodule Supavisor.SecretChecker do
     manager_secrets = Supavisor.Tenants.get_manager_user_cache(tenant_external_id)
 
     state = %{
+      id: args.id,
       tenant: tenant_external_id,
       tenant_record: tenant,
       manager_secrets: manager_secrets,
@@ -121,7 +123,10 @@ defmodule Supavisor.SecretChecker do
         validation_secrets = ValidationSecrets.from_sasl_secrets(sasl_secrets)
 
         case ClientAuthentication.refresh_if_changed(state.tenant, state.user, validation_secrets) do
-          :changed -> Logger.info("Secrets changed or not present, updating cache")
+          :changed ->
+            Logger.info("Secrets changed or not present, updating cache")
+            true = UpstreamAuthentication.delete_upstream_auth_secrets(state.id)
+
           :noop -> :ok
         end
 
